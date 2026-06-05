@@ -2,12 +2,364 @@ fn gen_yaml(path, data) {
     file_write(path, `---
 ${yaml_encode(data)}`);
 }
+fn gen_crd_yaml(path, data) {
+    file_write(path, `# yamllint disable rule:line-length
+---
+${yaml_encode(data)}`);
+}
 fn gen_yaml_if(path, type, data) {
     file_write(path, `{{#if (ctx_have_crd this "${type}")}}
 ---
 ${yaml_encode(data)}
 {{/if}}
 `);
+}
+
+// Generate a kubernetes-valid random placeholder string (vXXXXXXXX).
+// Use as Helm release name AND --namespace= value so every occurrence in the
+// generated templates can be reliably replaced with {{instance.appslug}} or
+// {{instance.namespace}} without false positives.
+fn placeholder() {
+    let result = "vnsplaceholder";
+    try {
+        let r = shell_output("cat /proc/sys/kernel/random/uuid 2>/dev/null");
+        r.trim();                              // mute r en place, ne pas chaîner (retourne ())
+        let parts = r.split("-");
+        if parts.len() >= 1 && parts[0].len() >= 4 {
+            result = `v${parts[0]}`;           // UUID déjà en minuscules
+        }
+    } catch(e) {}
+    result
+}
+
+// Generic text-level replacement across all files of a generated sub-directory.
+fn apply_replace_in_dir(dir_path, from, to) {
+    if !is_dir(dir_path) { return; }
+    for file in read_dir(dir_path) {
+        if is_file(file) {
+            let content = file_read(file);
+            content.replace(from, to);
+            file_write(file, content);
+        }
+    }
+}
+fn apply_replace_to_generated(path, from, to) {
+    for dir in ["get_crds", "get_systems", "get_scalables", "get_others", "get_vitals"] {
+        apply_replace_in_dir(`${path}/${dir}`, from, to);
+    }
+}
+
+fn apply_namespace_to_generated(path, ns) {
+    if ns == () || ns == "" { return; }
+    apply_replace_to_generated(path, ns, "{{instance.namespace}}");
+}
+
+// Replace every remaining occurrence of the release-name placeholder with {{instance.appslug}}.
+// Catches annotation values and other string fields not covered by structural replacements.
+fn apply_name_to_generated(path, name) {
+    if name == () || name == "" { return; }
+    apply_replace_to_generated(path, name, "{{instance.appslug}}");
+}
+
+// Read the package name from package.yaml (used to build the dedup pattern).
+fn read_pkg_name(path) {
+    if !is_file(`${path}/package.yaml`) { return (); }
+    let pkg_meta = yaml_decode(file_read(`${path}/package.yaml`));
+    if type_of(pkg_meta["metadata"]) == "map" { pkg_meta["metadata"]["name"] } else { () }
+}
+
+// Remove the redundant pkg_name segment that appears right after {{instance.appslug}}
+// when the Helm chart's fullname pattern is {release}-{pkg} (e.g. cert-manager).
+// Must be called after apply_name_to_generated so the placeholder has been resolved.
+fn apply_dedup_to_generated(path, pkg_name) {
+    if pkg_name == () || pkg_name == "" { return; }
+    apply_replace_to_generated(path, `{{instance.appslug}}-${pkg_name}`, "{{instance.appslug}}");
+}
+
+// ---------------------------------------------------------------------------
+// Image and resource extraction from containers
+// ---------------------------------------------------------------------------
+
+// Parse an image string into registry/repository/tag.
+// Registry is detected as the first slash-segment that contains a dot or is "localhost".
+// If no registry is detected, registry is set to "".
+fn parse_image(image_str) {
+    let s = `${image_str}`;
+    let registry = "";
+    let repository = s;
+    let tag = ();
+
+    let slash_parts = s.split("/");
+    if slash_parts.len() > 1 {
+        let first = slash_parts[0];
+        if first.contains(".") || first == "localhost" {
+            registry = first;
+            let rest = [];
+            let i = 0;
+            for p in slash_parts {
+                if i > 0 { rest.push(p); }
+                i += 1;
+            }
+            repository = rest.reduce(|acc, x| if acc == "" { x } else { `${acc}/${x}` }, "");
+        }
+    }
+
+    // Extract tag as the segment after the last ":"
+    let colon_parts = repository.split(":");
+    if colon_parts.len() >= 2 {
+        tag = colon_parts.pop();
+        repository = colon_parts.reduce(|acc, x| if acc == "" { x } else { `${acc}:${x}` }, "");
+    }
+
+    #{registry: registry, repository: repository, tag: tag}
+}
+
+fn make_img_key(release_name, container_name) {
+    let k = `${container_name}`;
+    k.replace(" ", "-");
+    k.replace("/", "-");
+    // Strip the release-name prefix so image keys don't embed the placeholder
+    let prefix = `${release_name}-`;
+    if k.starts_with(prefix) {
+        k.replace(prefix, "");
+    } else if k == release_name {
+        k = "app";
+    }
+    if k == "" { k = "app"; }
+    k
+}
+
+// Strip the release name prefix from a doc name for use in file paths.
+// "v3fdf80f5-traefik" + "v3fdf80f5" → "traefik"
+fn clean_file_name(doc_name, release_name) {
+    clean_file_name(doc_name, release_name, ())
+}
+fn clean_file_name(doc_name, release_name, ns) {
+    let prefix = `${release_name}-`;
+    if doc_name.starts_with(prefix) {
+        doc_name.replace(prefix, "");
+    } else if doc_name == release_name {
+        doc_name = "app";
+    }
+    // Strip the namespace placeholder so file names are stable across regenerations.
+    if ns != () && ns != "" {
+        doc_name.replace(`-${ns}`, "");
+        doc_name.replace(ns, "");
+        while doc_name.contains("--") { doc_name.replace("--", "-"); }
+    }
+    if doc_name == "" { doc_name = "app"; }
+    doc_name
+}
+
+// Extract images and resources from a container list.
+// Returns #{containers, images, resources}.
+fn extract_images_resources_from_containers(containers, prefix, release_name) {
+    let images = #{};
+    let resources = #{};
+    let result = [];
+    for c in containers {
+        let c_name = if "name" in c && c.name != () { make_img_key(release_name, `${c.name}`) } else { "app" };
+        let key = if prefix != "" { `${prefix}-${c_name}` } else { c_name };
+        if "image" in c && c.image != () && type_of(c.image) == "string" {
+            let parsed = parse_image(c.image);
+            images[key] = #{registry: parsed.registry, repository: parsed.repository};
+            if parsed.tag != () { images[key].tag = parsed.tag; }
+            c.image = `IMAGE_CTX_${key}`;
+        }
+        if "resources" in c && c.resources != () && type_of(c.resources) == "map" {
+            resources[key] = c.resources;
+            c.resources = `RESOURCES_CTX_${key}`;
+        }
+        // Extract --*-image=<img> patterns from args
+        if "args" in c && c.args != () {
+            let new_args = [];
+            for arg in c.args {
+                let a = `${arg}`;
+                if a.contains("-image=") {
+                    let parts = a.split("=");
+                    if parts.len() >= 2 {
+                        let flag = parts[0];
+                        let img_str = parts[1];
+                        let flag_parts = flag.split("--");
+                        // Flag names (--acme-http01-solver-image) don't carry the release prefix
+                        let arg_key = make_img_key("", if flag_parts.len() >= 2 { flag_parts[1] } else { flag });
+                        let parsed = parse_image(img_str);
+                        images[arg_key] = #{registry: parsed.registry, repository: parsed.repository};
+                        if parsed.tag != () { images[arg_key].tag = parsed.tag; }
+                        a = `${flag}=IMAGE_CTX_${arg_key}`;
+                    }
+                }
+                new_args.push(a);
+            }
+            c.args = new_args;
+        }
+        result.push(c);
+    }
+    #{containers: result, images: images, resources: resources}
+}
+
+// Extract images/resources from a workload (Deployment/StatefulSet/Job…).
+fn extract_workload_images_resources(doc, release_name) {
+    let images = #{};
+    let resources = #{};
+    if "spec" in doc && doc.spec != () && "template" in doc.spec && doc.spec.template != ()
+            && "spec" in doc.spec.template && doc.spec.template.spec != () {
+        let spec = doc.spec.template.spec;
+        for field in ["containers", "initContainers"] {
+            if field in spec && spec[field] != () {
+                let prefix = if field == "initContainers" { "init" } else { "" };
+                let extr = extract_images_resources_from_containers(spec[field], prefix, release_name);
+                spec[field] = extr.containers;
+                for k in extr.images.keys() { images[k] = extr.images[k]; }
+                for k in extr.resources.keys() { resources[k] = extr.resources[k]; }
+            }
+        }
+        doc.spec.template.spec = spec;
+    }
+    #{doc: doc, images: images, resources: resources}
+}
+
+// Extract images/resources from a CronJob.
+fn extract_cronjob_images_resources(doc, release_name) {
+    let images = #{};
+    let resources = #{};
+    if "spec" in doc && doc.spec != () && "jobTemplate" in doc.spec && doc.spec.jobTemplate != ()
+            && "spec" in doc.spec.jobTemplate && doc.spec.jobTemplate.spec != ()
+            && "template" in doc.spec.jobTemplate.spec && doc.spec.jobTemplate.spec.template != ()
+            && "spec" in doc.spec.jobTemplate.spec.template && doc.spec.jobTemplate.spec.template.spec != () {
+        let spec = doc.spec.jobTemplate.spec.template.spec;
+        for field in ["containers", "initContainers"] {
+            if field in spec && spec[field] != () {
+                let prefix = if field == "initContainers" { "init" } else { "" };
+                let extr = extract_images_resources_from_containers(spec[field], prefix, release_name);
+                spec[field] = extr.containers;
+                for k in extr.images.keys() { images[k] = extr.images[k]; }
+                for k in extr.resources.keys() { resources[k] = extr.resources[k]; }
+            }
+        }
+        doc.spec.jobTemplate.spec.template.spec = spec;
+    }
+    #{doc: doc, images: images, resources: resources}
+}
+
+// Replace IMAGE_CTX_* and RESOURCES_CTX_* markers with HBS expressions in a file.
+fn apply_image_resource_expressions(filepath, images_keys, resources_keys) {
+    let content = file_read(filepath);
+    for key in images_keys {
+        let marker = `IMAGE_CTX_${key}`;
+        let expr = `{{image_from_ctx this "${key}"}}`;
+        content.replace(marker, expr);
+        content.replace(`"${marker}"`, expr);
+        content.replace(`'${marker}'`, expr);
+    }
+    for key in resources_keys {
+        let marker = `RESOURCES_CTX_${key}`;
+        let expr = `{{json_to_str (resources_from_ctx this "${key}")}}`;
+        content.replace(marker, expr);
+        content.replace(`"${marker}"`, expr);
+        content.replace(`'${marker}'`, expr);
+    }
+    file_write(filepath, content);
+}
+
+// Update package.yaml with extracted images and resources (always overwrites existing entries).
+//
+// Pure string approach: never re-parse the file through yaml_decode_ordered.
+// rust_yaml RoundTrip mode stores per-node span metadata. Block scalars (>, |, >-, |-)
+// carry special metadata that makes dump_str produce corrupted output whenever any node
+// without that metadata is inserted. String manipulation avoids the issue entirely.
+fn update_package_yaml_images_resources(path, images, resources) {
+    if images.len() == 0 && resources.len() == 0 { return; }
+    let pkg_path = `${path}/package.yaml`;
+    if !is_file(pkg_path) { return; }
+
+    let nl = "\n";
+
+    // Build new images section text
+    let images_text = "";
+    if images.len() > 0 {
+        images_text = "images:";
+        for k in images.keys() {
+            let img = images[k];
+            images_text = `${images_text}${nl}  ${k}:`;
+            images_text = `${images_text}${nl}    registry: ${img["registry"]}`;
+            images_text = `${images_text}${nl}    repository: ${img["repository"]}`;
+            if type_of(img["tag"]) == "string" && img["tag"] != "" {
+                images_text = `${images_text}${nl}    tag: ${img["tag"]}`;
+            }
+        }
+    }
+
+    // Build new resources section text
+    let resources_text = "";
+    if resources.len() > 0 {
+        resources_text = "resources:";
+        for k in resources.keys() {
+            let res = resources[k];
+            resources_text = `${resources_text}${nl}  ${k}:`;
+            for phase in ["requests", "limits"] {
+                if type_of(res[phase]) == "map" {
+                    resources_text = `${resources_text}${nl}    ${phase}:`;
+                    for field in res[phase].keys() {
+                        resources_text = `${resources_text}${nl}      ${field}: ${res[phase][field]}`;
+                    }
+                }
+            }
+        }
+    }
+
+    // Read original file and rebuild line by line, replacing existing sections
+    let original = file_read(pkg_path);
+    let lines = original.split(nl);
+    let new_lines = [];
+    let in_section = false;
+    let images_written = false;
+    let resources_written = false;
+
+    for line in lines {
+        // Top-level key: no leading whitespace, not empty, not comment, not list item
+        let is_top = line.len() > 0 && !line.starts_with(" ") && !line.starts_with("\t")
+                  && !line.starts_with("#") && !line.starts_with("-");
+        if is_top {
+            if line.starts_with("images:") {
+                if images_text != "" {
+                    // Replace section with new content; skip original header and children
+                    in_section = true;
+                    new_lines.push(images_text);
+                    images_written = true;
+                    continue;
+                }
+                // No new images: keep original section as-is
+                in_section = false;
+            } else if line.starts_with("resources:") {
+                if resources_text != "" {
+                    in_section = true;
+                    new_lines.push(resources_text);
+                    resources_written = true;
+                    continue;
+                }
+                in_section = false;
+            } else {
+                in_section = false;
+            }
+        }
+        if in_section { continue; }
+        new_lines.push(line);
+    }
+
+    // Append sections not found in original
+    if !images_written && images_text != "" { new_lines.push(images_text); }
+    if !resources_written && resources_text != "" { new_lines.push(resources_text); }
+
+    // Join lines preserving original line endings
+    let content = new_lines.reduce(|acc, x| if acc == "" { x } else { `${acc}${nl}${x}` }, "");
+
+    // Ensure document separator
+    if !content.starts_with("---") {
+        content = `---${nl}${content}`;
+    }
+
+    file_write(pkg_path, content);
 }
 
 // ---------------------------------------------------------------------------
@@ -44,9 +396,8 @@ fn clean_metadata(metadata, name) {
             metadata.remove("annotations");
         }
     }
-    // Replace name in label values
-    if "labels" in metadata && metadata.labels != () {
-        metadata.labels = replace_label_values(metadata.labels, name);
+    if "labels" in metadata {
+        metadata.remove("labels");
     }
     metadata
 }
@@ -119,6 +470,10 @@ fn replace_volumes(volumes, name) {
 fn replace_containers(containers, name) {
     let result = [];
     for c in containers {
+        // Strip release-name prefix from container name (e.g. "v3fdf80f5-traefik" → "traefik")
+        if "name" in c && c.name != () {
+            c.name = clean_file_name(`${c.name}`, name);
+        }
         if "envFrom" in c && c.envFrom != () {
             let ef_list = [];
             for ef in c.envFrom {
@@ -151,6 +506,16 @@ fn replace_containers(containers, name) {
                 env_list.push(e);
             }
             c.env = env_list;
+        }
+        // Replace release name in all arg values (not just --*-image= ones)
+        if "args" in c && c.args != () {
+            let new_args = [];
+            for arg in c.args {
+                let a = `${arg}`;
+                a.replace(name, "{{instance.appslug}}");
+                new_args.push(a);
+            }
+            c.args = new_args;
         }
         result.push(c);
     }
@@ -319,8 +684,9 @@ fn extract_env_configmap(path, doc_name, doc, name) {
         metadata: #{name: cm_name},
         data: env_data,
     };
+    let cm_file_name = clean_file_name(doc_name, name);
     create_dir(`${path}/get_others`);
-    gen_yaml(`${path}/get_others/ConfigMap_${doc_name}-envs.yaml.hbs`, cm);
+    gen_yaml(`${path}/get_others/ConfigMap_${cm_file_name}-envs.yaml.hbs`, cm);
 
     // Update containers: remove plain envs, prepend envFrom reference
     let spec = doc.spec.template.spec;
@@ -434,7 +800,7 @@ fn add_reloader_annotations(metadata, spec) {
 // Binding / webhook helpers
 // ---------------------------------------------------------------------------
 
-fn replace_binding(doc, name) {
+fn replace_binding_impl(doc, name, roleref_prefix) {
     if "subjects" in doc && doc.subjects != () {
         let subj = [];
         for s in doc.subjects {
@@ -445,12 +811,22 @@ fn replace_binding(doc, name) {
         doc.subjects = subj;
     }
     if "roleRef" in doc && doc.roleRef != () {
-        doc.roleRef.name.replace(name, "{{instance.appslug}}");
+        doc.roleRef.name.replace(name, roleref_prefix);
         if "namespace" in doc.roleRef && doc.roleRef.namespace != () {
             doc.roleRef.namespace = "{{instance.namespace}}";
         }
     }
     doc
+}
+
+// RoleBinding : roleRef pointe un Role namespace-scoped → pas de préfixe namespace.
+fn replace_binding(doc, name) {
+    replace_binding_impl(doc, name, "{{instance.appslug}}")
+}
+// ClusterRoleBinding : roleRef doit matcher le metadata.name du ClusterRole,
+// qui est préfixé par {{instance.namespace}}-{{instance.appslug}} dans gen_system.
+fn replace_cluster_binding(doc, name) {
+    replace_binding_impl(doc, name, "{{instance.namespace}}-{{instance.appslug}}")
 }
 
 fn replace_webhooks(doc, name) {
@@ -741,25 +1117,30 @@ fn find_comp_for_svc_labels(analysis, sm_selector) {
 // Set marker strings in workload doc for selector/label fields
 fn apply_workload_selectors(doc, comp) {
     let marker = `SELECTOR_COMP_${comp}`;
-    if "metadata" in doc && doc.metadata != () {
-        doc.metadata.labels = "LABELS_FROM_CTX";
-    }
     if "spec" in doc && doc.spec != () {
         if "selector" in doc.spec && doc.spec.selector != () && "matchLabels" in doc.spec.selector {
             doc.spec.selector.matchLabels = marker;
         }
-        if "template" in doc.spec && doc.spec.template != () && "metadata" in doc.spec.template && doc.spec.template.metadata != () {
-            doc.spec.template.metadata.labels = "LABELS_FROM_CTX";
-        }
-        if "topologySpreadConstraints" in doc.spec && doc.spec.topologySpreadConstraints != () {
-            let tscs = [];
-            for tsc in doc.spec.topologySpreadConstraints {
-                if "labelSelector" in tsc && tsc.labelSelector != () && "matchLabels" in tsc.labelSelector {
-                    tsc.labelSelector.matchLabels = marker;
-                }
-                tscs.push(tsc);
+        if "template" in doc.spec && doc.spec.template != () {
+            if "metadata" in doc.spec.template && doc.spec.template.metadata != () {
+                doc.spec.template.metadata.labels = "LABELS_FROM_CTX";
             }
-            doc.spec.topologySpreadConstraints = tscs;
+            // TSC vit dans le pod spec (spec.template.spec), pas dans le workload spec (spec).
+            // Extraire le pod_spec pour éviter les problèmes d'assignation profonde.
+            if "spec" in doc.spec.template && doc.spec.template.spec != () {
+                let pod_spec = doc.spec.template.spec;
+                if "topologySpreadConstraints" in pod_spec && pod_spec.topologySpreadConstraints != () {
+                    let tscs = [];
+                    for tsc in pod_spec.topologySpreadConstraints {
+                        if "labelSelector" in tsc && tsc.labelSelector != () && "matchLabels" in tsc.labelSelector {
+                            tsc.labelSelector = #{matchLabels: marker};
+                        }
+                        tscs.push(tsc);
+                    }
+                    pod_spec.topologySpreadConstraints = tscs;
+                }
+                doc.spec.template.spec = pod_spec;
+            }
         }
     }
     doc
@@ -767,9 +1148,6 @@ fn apply_workload_selectors(doc, comp) {
 
 // Set marker strings in a Service doc
 fn apply_svc_selectors(doc, comp) {
-    if "metadata" in doc && doc.metadata != () {
-        doc.metadata.labels = "LABELS_FROM_CTX";
-    }
     if "spec" in doc && doc.spec != () && "selector" in doc.spec {
         doc.spec.selector = `SELECTOR_COMP_${comp}`;
     }
@@ -781,7 +1159,7 @@ fn apply_selector_expressions(filepath, comp) {
     let content = file_read(filepath);
     let sel_marker = `SELECTOR_COMP_${comp}`;
     let sel_expr = `{{json_to_str (selector_from_ctx this comp="${comp}")}}`;
-    let lbl_expr = "{{json_to_str (labels_from_ctx this)}}";
+    let lbl_expr = `{{json_to_str (labels_from_ctx this comp="${comp}")}}`;
     // Unquoted markers (yaml_encode normally won't quote these safe strings)
     content.replace(sel_marker, sel_expr);
     content.replace("LABELS_FROM_CTX", lbl_expr);
@@ -797,26 +1175,35 @@ fn apply_selector_expressions(filepath, comp) {
 // gen_system
 // ---------------------------------------------------------------------------
 
-fn gen_system(path, docs, name) {
+fn gen_system_core(path, docs, name, ns) {
     if name != () {
         let analysis = build_analysis(docs, name);
+        let all_images = #{};
+        let all_resources = #{};
         for doc in docs.filter(|obj| type_of(obj) == "map" && obj.keys().contains("kind") && obj.keys().contains("metadata") && type_of(obj.metadata) == "map") {
             if doc.kind == "CustomResourceDefinition" {
                 create_dir(`${path}/get_crds`);
+                doc.metadata = clean_metadata(doc.metadata, name);
                 if "conversion" in doc.spec && doc.spec.conversion != () {
                     if "webhook" in doc.spec.conversion && doc.spec.conversion.webhook != () {
                         doc.spec.conversion.webhook.clientConfig.service.name.replace(name, "{{instance.appslug}}");
                         doc.spec.conversion.webhook.clientConfig.service.namespace = "{{instance.namespace}}";
                     }
-                    gen_yaml(`${path}/get_crds/${doc.metadata.name}.yaml.hbs`, doc);
+                    gen_crd_yaml(`${path}/get_crds/${doc.metadata.name}.yaml.hbs`, doc);
                 } else {
-                    gen_yaml(`${path}/get_crds/${doc.metadata.name}.yaml`, doc);
+                    gen_crd_yaml(`${path}/get_crds/${doc.metadata.name}.yaml`, doc);
                 }
             } else if doc.kind != () && doc.kind != "Namespace" {
                 create_dir(`${path}/get_systems`);
-                let doc_name = doc.metadata.name;
+                let doc_name = doc.metadata.name;   // original — used for analysis lookups
+                let file_name = clean_file_name(`${doc_name}`, name, ns);  // sanitized for file path
                 if doc.kind == "ClusterRoleBinding" || doc.kind == "ClusterRole" || doc.kind == "ValidatingWebhookConfiguration" || doc.kind == "MutatingWebhookConfiguration" || doc.kind == "APIService" {
                     doc.metadata.name.replace(name, "{{instance.namespace}}-{{instance.appslug}}");
+                    // Strip ns placeholder: il est déjà dans le préfixe {{instance.namespace}}-
+                    if ns != () && ns != "" {
+                        doc.metadata.name.replace(`-${ns}`, "");
+                        doc.metadata.name.replace(ns, "");
+                    }
                 } else {
                     doc.metadata.name.replace(name, "{{instance.appslug}}");
                 }
@@ -824,7 +1211,14 @@ fn gen_system(path, docs, name) {
                     doc.metadata.remove("namespace");
                 }
                 doc.metadata = clean_metadata(doc.metadata, name);
-                if doc.kind == "ClusterRoleBinding" || doc.kind == "RoleBinding" {
+                if doc.kind == "ClusterRoleBinding" {
+                    doc = replace_cluster_binding(doc, name);
+                    // Aligner le roleRef sur le même nettoyage ns
+                    if ns != () && ns != "" && "roleRef" in doc && doc.roleRef != () {
+                        doc.roleRef.name.replace(`-${ns}`, "");
+                        doc.roleRef.name.replace(ns, "");
+                    }
+                } else if doc.kind == "RoleBinding" {
                     doc = replace_binding(doc, name);
                 }
                 if doc.kind == "ValidatingWebhookConfiguration" || doc.kind == "MutatingWebhookConfiguration" {
@@ -835,63 +1229,114 @@ fn gen_system(path, docs, name) {
                     doc.spec.service.namespace = "{{instance.namespace}}";
                 }
                 if ["Deployment", "ReplicaSet", "StatefulSet", "DaemonSet"].contains(doc.kind) {
+                    let extr = extract_workload_images_resources(doc, name);
+                    doc = extr.doc;
+                    for k in extr.images.keys() { all_images[k] = extr.images[k]; }
+                    for k in extr.resources.keys() { all_resources[k] = extr.resources[k]; }
                     doc = replace_workload(path, doc_name, doc, name);
                     let comp = if doc_name in analysis.comp_map { analysis.comp_map[doc_name] } else { "" };
                     if comp != "" { doc = apply_workload_selectors(doc, comp); }
-                    let fp = `${path}/get_systems/${doc.kind}_${doc_name}.yaml.hbs`;
+                    let fp = `${path}/get_systems/${doc.kind}_${file_name}.yaml.hbs`;
                     gen_yaml(fp, doc);
+                    if extr.images.len() > 0 || extr.resources.len() > 0 {
+                        apply_image_resource_expressions(fp, extr.images.keys(), extr.resources.keys());
+                    }
                     if comp != "" { apply_selector_expressions(fp, comp); }
                 } else if doc.kind == "Job" {
+                    let extr = extract_workload_images_resources(doc, name);
+                    doc = extr.doc;
+                    for k in extr.images.keys() { all_images[k] = extr.images[k]; }
+                    for k in extr.resources.keys() { all_resources[k] = extr.resources[k]; }
                     doc = replace_job(path, doc_name, doc, name);
-                    gen_yaml(`${path}/get_systems/${doc.kind}_${doc_name}.yaml.hbs`, doc);
+                    let fp = `${path}/get_systems/${doc.kind}_${file_name}.yaml.hbs`;
+                    gen_yaml(fp, doc);
+                    if extr.images.len() > 0 || extr.resources.len() > 0 {
+                        apply_image_resource_expressions(fp, extr.images.keys(), extr.resources.keys());
+                    }
                 } else if doc.kind == "CronJob" {
+                    let extr = extract_cronjob_images_resources(doc, name);
+                    doc = extr.doc;
+                    for k in extr.images.keys() { all_images[k] = extr.images[k]; }
+                    for k in extr.resources.keys() { all_resources[k] = extr.resources[k]; }
                     doc = replace_cronjob(path, doc_name, doc, name);
-                    gen_yaml(`${path}/get_systems/${doc.kind}_${doc_name}.yaml.hbs`, doc);
+                    let fp = `${path}/get_systems/${doc.kind}_${file_name}.yaml.hbs`;
+                    gen_yaml(fp, doc);
+                    if extr.images.len() > 0 || extr.resources.len() > 0 {
+                        apply_image_resource_expressions(fp, extr.images.keys(), extr.resources.keys());
+                    }
                 } else if doc.kind == "HorizontalPodAutoscaler" && "scaleTargetRef" in doc.spec && doc.spec.scaleTargetRef != () {
                     doc.spec.scaleTargetRef.name.replace(name, "{{instance.appslug}}");
-                    gen_yaml(`${path}/get_systems/${doc.kind}_${doc_name}.yaml.hbs`, doc);
+                    gen_yaml(`${path}/get_systems/${doc.kind}_${file_name}.yaml.hbs`, doc);
                 } else if doc.kind == "Service" && doc_name in analysis.svc_comp_map {
                     let comp = analysis.svc_comp_map[doc_name];
                     doc = apply_svc_selectors(doc, comp);
-                    let fp = `${path}/get_systems/${doc.kind}_${doc_name}.yaml.hbs`;
+                    let fp = `${path}/get_systems/${doc.kind}_${file_name}.yaml.hbs`;
                     gen_yaml(fp, doc);
                     apply_selector_expressions(fp, comp);
                 } else if doc.kind == "ServiceMonitor" {
-                    let fp = `${path}/get_systems/${doc.kind}_${doc_name}.yaml.hbs`;
+                    let fp = `${path}/get_systems/${doc.kind}_${file_name}.yaml.hbs`;
                     let res_comp = "";
                     if "spec" in doc && doc.spec != () && "selector" in doc.spec && doc.spec.selector != () && "matchLabels" in doc.spec.selector && doc.spec.selector.matchLabels != () {
                         res_comp = find_comp_for_svc_labels(analysis, doc.spec.selector.matchLabels);
                         if res_comp != "" {
                             doc.spec.selector.matchLabels = `SELECTOR_COMP_${res_comp}`;
-                            doc.metadata.labels = "LABELS_FROM_CTX";
                         }
                     }
                     gen_yaml_if(fp, "servicemonitors.monitoring.coreos.com", doc);
                     if res_comp != "" { apply_selector_expressions(fp, res_comp); }
                 } else if doc.kind == "PrometheusRule" {
-                    gen_yaml_if(`${path}/get_systems/${doc.kind}_${doc_name}.yaml.hbs`, "prometheusrules.monitoring.coreos.com", doc);
+                    gen_yaml_if(`${path}/get_systems/${doc.kind}_${file_name}.yaml.hbs`, "prometheusrules.monitoring.coreos.com", doc);
                 } else {
-                    gen_yaml(`${path}/get_systems/${doc.kind}_${doc_name}.yaml.hbs`, doc);
+                    // NetworkPolicy and PodDisruptionBudget: replace podSelector/spec.selector matchLabels
+                    let res_comp = "";
+                    if doc.kind == "NetworkPolicy" && "spec" in doc && doc.spec != () && "podSelector" in doc.spec && doc.spec.podSelector != () && "matchLabels" in doc.spec.podSelector && doc.spec.podSelector.matchLabels != () {
+                        res_comp = find_comp_for_selector(analysis, doc.spec.podSelector.matchLabels);
+                        if res_comp != "" {
+                            doc.spec.podSelector.matchLabels = `SELECTOR_COMP_${res_comp}`;
+                        }
+                    } else if doc.kind == "PodDisruptionBudget" && "spec" in doc && doc.spec != () && "selector" in doc.spec && doc.spec.selector != () && "matchLabels" in doc.spec.selector && doc.spec.selector.matchLabels != () {
+                        res_comp = find_comp_for_selector(analysis, doc.spec.selector.matchLabels);
+                        if res_comp != "" {
+                            doc.spec.selector.matchLabels = `SELECTOR_COMP_${res_comp}`;
+                        }
+                    }
+                    let fp = `${path}/get_systems/${doc.kind}_${file_name}.yaml.hbs`;
+                    gen_yaml(fp, doc);
+                    if res_comp != "" { apply_selector_expressions(fp, res_comp); }
                 }
             }
         }
+        update_package_yaml_images_resources(path, all_images, all_resources);
     }
+}
+fn gen_system(path, docs, name) {
+    gen_system_core(path, docs, name, ());
 }
 fn gen_system(path, docs) {
     let yaml = yaml_decode(file_read(path+"/package.yaml"));
     let name = if type_of(yaml["metadata"]) == "map" {yaml["metadata"]["name"]} else {()};
-    gen_system(path, docs, name);
+    gen_system_core(path, docs, name, ());
+    apply_dedup_to_generated(path, name);
+}
+fn gen_system(path, docs, name, ns) {
+    gen_system_core(path, docs, name, ns);
+    apply_name_to_generated(path, name);
+    apply_namespace_to_generated(path, ns);
+    apply_dedup_to_generated(path, read_pkg_name(path));
 }
 
 // ---------------------------------------------------------------------------
 // gen_tenant
 // ---------------------------------------------------------------------------
 
-fn gen_tenant(path, docs, name) {
+fn gen_tenant_core(path, docs, name, ns) {
     if name != () {
         let analysis = build_analysis(docs, name);
+        let all_images = #{};
+        let all_resources = #{};
         for doc in docs.filter(|obj| type_of(obj) == "map" && obj.keys().contains("kind") && obj.keys().contains("metadata") && type_of(obj.metadata) == "map" && obj.kind != ()) {
             let doc_name = doc.metadata.name;
+            let file_name = clean_file_name(`${doc_name}`, name, ns);
             doc.metadata.name.replace(name, "{{instance.appslug}}");
             if "namespace" in doc.metadata {
                 doc.metadata.remove("namespace");
@@ -899,14 +1344,21 @@ fn gen_tenant(path, docs, name) {
             doc.metadata = clean_metadata(doc.metadata, name);
             if ["PersistentVolumeClaim"].contains(doc.kind) {
                 create_dir(`${path}/get_vitals`);
-                gen_yaml(`${path}/get_vitals/${doc.kind}_${doc_name}.yaml.hbs`, doc);
+                gen_yaml(`${path}/get_vitals/${doc.kind}_${file_name}.yaml.hbs`, doc);
             } else if ["Deployment", "ReplicaSet", "StatefulSet", "DaemonSet"].contains(doc.kind) {
                 create_dir(`${path}/get_scalables`);
+                let extr = extract_workload_images_resources(doc, name);
+                doc = extr.doc;
+                for k in extr.images.keys() { all_images[k] = extr.images[k]; }
+                for k in extr.resources.keys() { all_resources[k] = extr.resources[k]; }
                 doc = replace_workload(path, doc_name, doc, name);
                 let comp = if doc_name in analysis.comp_map { analysis.comp_map[doc_name] } else { "" };
                 if comp != "" { doc = apply_workload_selectors(doc, comp); }
-                let fp = `${path}/get_scalables/${doc.kind}_${doc_name}.yaml.hbs`;
+                let fp = `${path}/get_scalables/${doc.kind}_${file_name}.yaml.hbs`;
                 gen_yaml(fp, doc);
+                if extr.images.len() > 0 || extr.resources.len() > 0 {
+                    apply_image_resource_expressions(fp, extr.images.keys(), extr.resources.keys());
+                }
                 if comp != "" { apply_selector_expressions(fp, comp); }
             } else if ["Namespace", "CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding", "ValidatingWebhookConfiguration", "MutatingWebhookConfiguration", "APIService"].contains(doc.kind) {
                 create_dir(`${path}/get_systems`);
@@ -920,16 +1372,25 @@ fn gen_tenant(path, docs, name) {
                     doc.spec.service.name.replace(name, "{{instance.appslug}}");
                     doc.spec.service.namespace = "{{instance.namespace}}";
                 }
-                gen_yaml(`${path}/get_systems/${doc.kind}_${doc_name}.yaml.hbs`, doc);
+                gen_yaml(`${path}/get_systems/${doc.kind}_${file_name}.yaml.hbs`, doc);
             } else {
                 create_dir(`${path}/get_others`);
                 if doc.kind == "RoleBinding" {
                     doc = replace_binding(doc, name);
                 }
+                let img_extr = #{images: #{}, resources: #{}};
                 if doc.kind == "Job" {
+                    img_extr = extract_workload_images_resources(doc, name);
+                    doc = img_extr.doc;
+                    for k in img_extr.images.keys() { all_images[k] = img_extr.images[k]; }
+                    for k in img_extr.resources.keys() { all_resources[k] = img_extr.resources[k]; }
                     doc = replace_job(path, doc_name, doc, name);
                 }
                 if doc.kind == "CronJob" {
+                    img_extr = extract_cronjob_images_resources(doc, name);
+                    doc = img_extr.doc;
+                    for k in img_extr.images.keys() { all_images[k] = img_extr.images[k]; }
+                    for k in img_extr.resources.keys() { all_resources[k] = img_extr.resources[k]; }
                     doc = replace_cronjob(path, doc_name, doc, name);
                 }
                 if doc.kind == "HorizontalPodAutoscaler" && "scaleTargetRef" in doc.spec && doc.spec.scaleTargetRef != () {
@@ -951,54 +1412,68 @@ fn gen_tenant(path, docs, name) {
                     res_comp = find_comp_for_selector(analysis, doc.spec.selector.matchLabels);
                     if res_comp != "" {
                         doc.spec.selector.matchLabels = `SELECTOR_COMP_${res_comp}`;
-                        doc.metadata.labels = "LABELS_FROM_CTX";
                     }
                 } else if doc.kind == "NetworkPolicy" && "spec" in doc && doc.spec != () && "podSelector" in doc.spec && doc.spec.podSelector != () && "matchLabels" in doc.spec.podSelector && doc.spec.podSelector.matchLabels != () {
                     res_comp = find_comp_for_selector(analysis, doc.spec.podSelector.matchLabels);
                     if res_comp != "" {
                         doc.spec.podSelector.matchLabels = `SELECTOR_COMP_${res_comp}`;
-                        doc.metadata.labels = "LABELS_FROM_CTX";
                     }
                 } else if doc.kind == "ServiceMonitor" && "spec" in doc && doc.spec != () && "selector" in doc.spec && doc.spec.selector != () && "matchLabels" in doc.spec.selector && doc.spec.selector.matchLabels != () {
                     res_comp = find_comp_for_svc_labels(analysis, doc.spec.selector.matchLabels);
                     if res_comp != "" {
                         doc.spec.selector.matchLabels = `SELECTOR_COMP_${res_comp}`;
-                        doc.metadata.labels = "LABELS_FROM_CTX";
                     }
                 }
 
                 if doc.kind == "ServiceMonitor" {
-                    let fp = `${path}/get_others/${doc.kind}_${doc_name}.yaml.hbs`;
+                    let fp = `${path}/get_others/${doc.kind}_${file_name}.yaml.hbs`;
                     gen_yaml_if(fp, "servicemonitors.monitoring.coreos.com", doc);
                     if res_comp != "" { apply_selector_expressions(fp, res_comp); }
                 } else if doc.kind == "PrometheusRule" {
-                    gen_yaml_if(`${path}/get_others/${doc.kind}_${doc_name}.yaml.hbs`, "prometheusrules.monitoring.coreos.com", doc);
+                    gen_yaml_if(`${path}/get_others/${doc.kind}_${file_name}.yaml.hbs`, "prometheusrules.monitoring.coreos.com", doc);
                 } else if doc.kind == "Certificate" {
-                    gen_yaml_if(`${path}/get_others/${doc.kind}_${doc_name}.yaml.hbs`, "certificates.cert-manager.io", doc);
+                    gen_yaml_if(`${path}/get_others/${doc.kind}_${file_name}.yaml.hbs`, "certificates.cert-manager.io", doc);
                 } else {
-                    let fp = `${path}/get_others/${doc.kind}_${doc_name}.yaml.hbs`;
+                    let fp = `${path}/get_others/${doc.kind}_${file_name}.yaml.hbs`;
                     gen_yaml(fp, doc);
+                    if img_extr.images.len() > 0 || img_extr.resources.len() > 0 {
+                        apply_image_resource_expressions(fp, img_extr.images.keys(), img_extr.resources.keys());
+                    }
                     if res_comp != "" { apply_selector_expressions(fp, res_comp); }
                 }
            }
         }
+        update_package_yaml_images_resources(path, all_images, all_resources);
     }
+}
+fn gen_tenant(path, docs, name) {
+    gen_tenant_core(path, docs, name, ());
 }
 fn gen_tenant(path, docs) {
     let yaml = yaml_decode(file_read(path+"/package.yaml"));
     let name = if type_of(yaml["metadata"]) == "map" {yaml["metadata"]["name"]} else {()};
-    gen_tenant(path, docs, name);
+    gen_tenant_core(path, docs, name, ());
+    apply_dedup_to_generated(path, name);
+}
+fn gen_tenant(path, docs, name, ns) {
+    gen_tenant_core(path, docs, name, ns);
+    apply_name_to_generated(path, name);
+    apply_namespace_to_generated(path, ns);
+    apply_dedup_to_generated(path, read_pkg_name(path));
 }
 
 // ---------------------------------------------------------------------------
 // gen_service
 // ---------------------------------------------------------------------------
 
-fn gen_service(path, docs, name) {
+fn gen_service_core(path, docs, name, ns) {
     if name != () {
         let analysis = build_analysis(docs, name);
+        let all_images = #{};
+        let all_resources = #{};
         for doc in docs.filter(|obj| type_of(obj) == "map" && obj.keys().contains("kind") && obj.keys().contains("metadata") && type_of(obj.metadata) == "map" && obj.kind != ()) {
             let doc_name = doc.metadata.name;
+            let file_name = clean_file_name(`${doc_name}`, name, ns);
             doc.metadata.name.replace(name, "{{instance.appslug}}");
             if "namespace" in doc.metadata {
                 doc.metadata.remove("namespace");
@@ -1006,29 +1481,37 @@ fn gen_service(path, docs, name) {
             doc.metadata = clean_metadata(doc.metadata, name);
             if ["PersistentVolumeClaim"].contains(doc.kind) {
                 create_dir(`${path}/get_vitals`);
-                gen_yaml(`${path}/get_vitals/${doc.kind}_${doc_name}.yaml.hbs`, doc);
+                gen_yaml(`${path}/get_vitals/${doc.kind}_${file_name}.yaml.hbs`, doc);
             } else if ["Deployment", "ReplicaSet", "StatefulSet", "DaemonSet"].contains(doc.kind) {
                 create_dir(`${path}/get_scalables`);
+                let extr = extract_workload_images_resources(doc, name);
+                doc = extr.doc;
+                for k in extr.images.keys() { all_images[k] = extr.images[k]; }
+                for k in extr.resources.keys() { all_resources[k] = extr.resources[k]; }
                 doc = replace_workload(path, doc_name, doc, name);
                 let comp = if doc_name in analysis.comp_map { analysis.comp_map[doc_name] } else { "" };
                 if comp != "" { doc = apply_workload_selectors(doc, comp); }
-                let fp = `${path}/get_scalables/${doc.kind}_${doc_name}.yaml.hbs`;
+                let fp = `${path}/get_scalables/${doc.kind}_${file_name}.yaml.hbs`;
                 gen_yaml(fp, doc);
+                if extr.images.len() > 0 || extr.resources.len() > 0 {
+                    apply_image_resource_expressions(fp, extr.images.keys(), extr.resources.keys());
+                }
                 if comp != "" { apply_selector_expressions(fp, comp); }
             } else if doc.kind == "CustomResourceDefinition" {
                 create_dir(`${path}/get_crds`);
+                doc.metadata = clean_metadata(doc.metadata, name);
                 if "conversion" in doc.spec && doc.spec.conversion != () {
                     if "webhook" in doc.spec.conversion && doc.spec.conversion.webhook != () {
                         doc.spec.conversion.webhook.clientConfig.service.name.replace(name, "{{instance.appslug}}");
                         doc.spec.conversion.webhook.clientConfig.service.namespace = "{{instance.namespace}}";
                     }
-                    gen_yaml(`${path}/get_crds/${doc.metadata.name}.yaml.hbs`, doc);
+                    gen_crd_yaml(`${path}/get_crds/${doc.metadata.name}.yaml.hbs`, doc);
                 } else {
-                    gen_yaml(`${path}/get_crds/${doc.metadata.name}.yaml`, doc);
+                    gen_crd_yaml(`${path}/get_crds/${doc.metadata.name}.yaml`, doc);
                 }
             } else if ["Namespace"].contains(doc.kind) {
                 create_dir(`${path}/get_systems`);
-                gen_yaml(`${path}/get_systems/${doc.kind}_${doc_name}.yaml.hbs`, doc);
+                gen_yaml(`${path}/get_systems/${doc.kind}_${file_name}.yaml.hbs`, doc);
             } else {
                 create_dir(`${path}/get_others`);
                 if doc.kind == "RoleBinding" || doc.kind == "ClusterRoleBinding" {
@@ -1041,10 +1524,19 @@ fn gen_service(path, docs, name) {
                     doc.spec.service.name.replace(name, "{{instance.appslug}}");
                     doc.spec.service.namespace = "{{instance.namespace}}";
                 }
+                let img_extr = #{images: #{}, resources: #{}};
                 if doc.kind == "Job" {
+                    img_extr = extract_workload_images_resources(doc, name);
+                    doc = img_extr.doc;
+                    for k in img_extr.images.keys() { all_images[k] = img_extr.images[k]; }
+                    for k in img_extr.resources.keys() { all_resources[k] = img_extr.resources[k]; }
                     doc = replace_job(path, doc_name, doc, name);
                 }
                 if doc.kind == "CronJob" {
+                    img_extr = extract_cronjob_images_resources(doc, name);
+                    doc = img_extr.doc;
+                    for k in img_extr.images.keys() { all_images[k] = img_extr.images[k]; }
+                    for k in img_extr.resources.keys() { all_resources[k] = img_extr.resources[k]; }
                     doc = replace_cronjob(path, doc_name, doc, name);
                 }
                 if doc.kind == "HorizontalPodAutoscaler" && "scaleTargetRef" in doc.spec && doc.spec.scaleTargetRef != () {
@@ -1066,41 +1558,52 @@ fn gen_service(path, docs, name) {
                     res_comp = find_comp_for_selector(analysis, doc.spec.selector.matchLabels);
                     if res_comp != "" {
                         doc.spec.selector.matchLabels = `SELECTOR_COMP_${res_comp}`;
-                        doc.metadata.labels = "LABELS_FROM_CTX";
                     }
                 } else if doc.kind == "NetworkPolicy" && "spec" in doc && doc.spec != () && "podSelector" in doc.spec && doc.spec.podSelector != () && "matchLabels" in doc.spec.podSelector && doc.spec.podSelector.matchLabels != () {
                     res_comp = find_comp_for_selector(analysis, doc.spec.podSelector.matchLabels);
                     if res_comp != "" {
                         doc.spec.podSelector.matchLabels = `SELECTOR_COMP_${res_comp}`;
-                        doc.metadata.labels = "LABELS_FROM_CTX";
                     }
                 } else if doc.kind == "ServiceMonitor" && "spec" in doc && doc.spec != () && "selector" in doc.spec && doc.spec.selector != () && "matchLabels" in doc.spec.selector && doc.spec.selector.matchLabels != () {
                     res_comp = find_comp_for_svc_labels(analysis, doc.spec.selector.matchLabels);
                     if res_comp != "" {
                         doc.spec.selector.matchLabels = `SELECTOR_COMP_${res_comp}`;
-                        doc.metadata.labels = "LABELS_FROM_CTX";
                     }
                 }
 
                 if doc.kind == "ServiceMonitor" {
-                    let fp = `${path}/get_others/${doc.kind}_${doc_name}.yaml.hbs`;
+                    let fp = `${path}/get_others/${doc.kind}_${file_name}.yaml.hbs`;
                     gen_yaml_if(fp, "servicemonitors.monitoring.coreos.com", doc);
                     if res_comp != "" { apply_selector_expressions(fp, res_comp); }
                 } else if doc.kind == "PrometheusRule" {
-                    gen_yaml_if(`${path}/get_others/${doc.kind}_${doc_name}.yaml.hbs`, "prometheusrules.monitoring.coreos.com", doc);
+                    gen_yaml_if(`${path}/get_others/${doc.kind}_${file_name}.yaml.hbs`, "prometheusrules.monitoring.coreos.com", doc);
                 } else if doc.kind == "Certificate" {
-                    gen_yaml_if(`${path}/get_others/${doc.kind}_${doc_name}.yaml.hbs`, "certificates.cert-manager.io", doc);
+                    gen_yaml_if(`${path}/get_others/${doc.kind}_${file_name}.yaml.hbs`, "certificates.cert-manager.io", doc);
                 } else {
-                    let fp = `${path}/get_others/${doc.kind}_${doc_name}.yaml.hbs`;
+                    let fp = `${path}/get_others/${doc.kind}_${file_name}.yaml.hbs`;
                     gen_yaml(fp, doc);
+                    if img_extr.images.len() > 0 || img_extr.resources.len() > 0 {
+                        apply_image_resource_expressions(fp, img_extr.images.keys(), img_extr.resources.keys());
+                    }
                     if res_comp != "" { apply_selector_expressions(fp, res_comp); }
                 }
            }
         }
+        update_package_yaml_images_resources(path, all_images, all_resources);
     }
+}
+fn gen_service(path, docs, name) {
+    gen_service_core(path, docs, name, ());
 }
 fn gen_service(path, docs) {
     let yaml = yaml_decode(file_read(path+"/package.yaml"));
     let name = if type_of(yaml["metadata"]) == "map" {yaml["metadata"]["name"]} else {()};
-    gen_service(path, docs, name);
+    gen_service_core(path, docs, name, ());
+    apply_dedup_to_generated(path, name);
+}
+fn gen_service(path, docs, name, ns) {
+    gen_service_core(path, docs, name, ns);
+    apply_name_to_generated(path, name);
+    apply_namespace_to_generated(path, ns);
+    apply_dedup_to_generated(path, read_pkg_name(path));
 }
