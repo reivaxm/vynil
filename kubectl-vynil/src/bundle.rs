@@ -96,7 +96,7 @@ pub async fn build_bundle(
 
     let manifest = Manifest {
         tool_version: tool_version.clone(),
-        api: "diag.vynil.solidite.fr/v1".to_string(),
+        api: "admin.vynil.solidite.fr/v1".to_string(),
         target: target.clone(),
         collected_at,
         transport: transport_label.to_string(),
@@ -299,7 +299,7 @@ mod tests {
     fn test_manifest_serialization() {
         let manifest = Manifest {
             tool_version: "0.7.7".to_string(),
-            api: "diag.vynil.solidite.fr/v1".to_string(),
+            api: "admin.vynil.solidite.fr/v1".to_string(),
             target: InstanceTarget {
                 namespace: "test-ns".to_string(),
                 kind: "systeminstances".to_string(),

@@ -44,11 +44,11 @@ where
     }
 }
 
-pub const API_GROUP: &str = "diag.vynil.solidite.fr";
+pub const API_GROUP: &str = "admin.vynil.solidite.fr";
 pub const API_VERSION: &str = "v1";
 
-const API_PATH: &str = "/apis/diag.vynil.solidite.fr/v1";
-const INSTANCE_PATH: &str = "/apis/diag.vynil.solidite.fr/v1/namespaces/:ns/:kind/:name/:item";
+const API_PATH: &str = "/apis/admin.vynil.solidite.fr/v1";
+const INSTANCE_PATH: &str = "/apis/admin.vynil.solidite.fr/v1/namespaces/:ns/:kind/:name/:item";
 
 /// Valid kinds for the diagnostic API
 const VALID_KINDS: [&str; 3] = ["tenantinstances", "serviceinstances", "systeminstances"];

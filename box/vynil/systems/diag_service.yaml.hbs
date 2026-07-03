@@ -17,11 +17,11 @@ spec:
 apiVersion: apiregistration.k8s.io/v1
 kind: APIService
 metadata:
-  name: v1.diag.vynil.solidite.fr
+  name: v1.admin.vynil.solidite.fr
   annotations:
     cert-manager.io/inject-ca-from: {{instance.namespace}}/{{instance.appslug}}-diag
 spec:
-  group: diag.vynil.solidite.fr
+  group: admin.vynil.solidite.fr
   version: v1
   groupPriorityMinimum: 1000
   versionPriority: 15

@@ -112,6 +112,11 @@ rules:
 - apiGroups: ["vynil.solidite.fr"]
   resources: ["jukeboxes", "systeminstances", "tenantinstances", "serviceinstances"]
   verbs: ["get", "watch", "list"]
+- apiGroups: ["admin.vynil.solidite.fr"]
+  resources: ["*"]        # couvre {kind} + subresources ({item}: clusterinfo, logs, …)
+  verbs: ["get"]
+  # Caveat : si le groupe admin gagne un jour des actions non-view (write/exec), les exclure ici
+  # (passer à une énumération explicite des subresources de diag).
 ---
 kind: ClusterRole
 apiVersion: rbac.authorization.k8s.io/v1

@@ -60,7 +60,7 @@ pub fn extension_for_content_type(content_type: &str) -> &'static str {
 /// Builds the full API path for a given item.
 pub fn api_path(target: &crate::cli::InstanceTarget, item: &str) -> String {
     format!(
-        "/apis/diag.vynil.solidite.fr/v1/namespaces/{}/{}/{}/{}",
+        "/apis/admin.vynil.solidite.fr/v1/namespaces/{}/{}/{}/{}",
         target.namespace, target.kind, target.name, item
     )
 }
@@ -124,7 +124,7 @@ mod tests {
         };
         assert_eq!(
             api_path(&target, "clusterinfo"),
-            "/apis/diag.vynil.solidite.fr/v1/namespaces/kydah-core/systeminstances/reloader/clusterinfo"
+            "/apis/admin.vynil.solidite.fr/v1/namespaces/kydah-core/systeminstances/reloader/clusterinfo"
         );
     }
 }
