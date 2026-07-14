@@ -456,10 +456,15 @@ pub async fn run_jukebox(args: &JukeboxArgs, context: Option<&str>) -> Result<()
 
 /// Top-level dispatch for the instance kinds. Resolves the namespace, defaulting
 /// to the selected kubectl context namespace when `-n` is omitted.
-pub async fn run_instance(info: &InstanceKindInfo, args: &InstanceArgs, context: Option<&str>) -> Result<()> {
+pub async fn run_instance(
+    info: &InstanceKindInfo,
+    args: &InstanceArgs,
+    context: Option<&str>,
+    namespace: Option<&str>,
+) -> Result<()> {
     use crate::cli::InstanceVerb::*;
-    let namespace = match &args.namespace {
-        Some(ns) => ns.clone(),
+    let namespace = match namespace {
+        Some(ns) => ns.to_string(),
         None => make_client(context)
             .await
             .context("INST-ERR-01: failed to create kube client")?

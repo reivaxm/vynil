@@ -3,7 +3,8 @@ use serde::Serialize;
 
 /// Vynil CLI — operate on Vynil instances and JukeBoxes from your kubectl context.
 ///
-/// Noun-first grammar: `kubectl-vynil <kind> [-n <ns>] <name> <verb> [args]`.
+/// `-n` and `--context` are global flags accepted anywhere, like `kubectl` itself.
+/// Grammar: `kubectl-vynil [-n <ns>] <kind> <name> <verb> [args]`.
 #[derive(Parser, Debug)]
 #[command(name = "kubectl-vynil", version, about, long_about = None)]
 pub struct Cli {
@@ -11,6 +12,9 @@ pub struct Cli {
     /// Defaults to the current context. Ignored in `--server-url` direct mode.
     #[arg(long, global = true)]
     pub context: Option<String>,
+    /// Namespace of the instance. Defaults to the current kubectl context namespace.
+    #[arg(short = 'n', long, global = true)]
+    pub namespace: Option<String>,
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -95,9 +99,6 @@ pub struct JukeboxScanArgs {
 pub struct InstanceArgs {
     /// Instance name.
     pub name: String,
-    /// Namespace of the instance. Defaults to the current kubectl context namespace.
-    #[arg(short, long)]
-    pub namespace: Option<String>,
     #[command(subcommand)]
     pub verb: InstanceVerb,
 }
@@ -273,12 +274,26 @@ mod tests {
     }
 
     #[test]
+    fn namespace_flag_parses_after_subcommand() {
+        // Global flag: -n accepted anywhere, like `kubectl get pod -n ns`.
+        let cli = Cli::try_parse_from(["kubectl-vynil", "vsi", "x", "upgrade", "-n", "post-ns"]).unwrap();
+        assert_eq!(cli.namespace.as_deref(), Some("post-ns"));
+        match cli.command {
+            Commands::Vsi(a) => {
+                assert_eq!(a.name, "x");
+                assert!(matches!(a.verb, InstanceVerb::Upgrade(_)));
+            }
+            _ => panic!("expected vsi"),
+        }
+    }
+
+    #[test]
     fn parses_instance_upgrade_verb_last_with_floating_flag() {
         // name before verb, -n placed between kind and name
         let cli = Cli::try_parse_from(["kubectl-vynil", "vsi", "-n", "toto", "titi", "upgrade"]).unwrap();
+        assert_eq!(cli.namespace.as_deref(), Some("toto"));
         match cli.command {
             Commands::Vsi(a) => {
-                assert_eq!(a.namespace.as_deref(), Some("toto"));
                 assert_eq!(a.name, "titi");
                 assert!(matches!(a.verb, InstanceVerb::Upgrade(_)));
             }

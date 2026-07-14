@@ -160,10 +160,8 @@ pub async fn build_base_recommendations(
                         rec_crds.push(crd);
                     }
                 }
-                VynilPackageRecommandation::SystemService(svc) => {
-                    if current_system_services.contains(&svc) {
-                        rec_system_services.push(svc);
-                    }
+                VynilPackageRecommandation::SystemService(svc) if current_system_services.contains(&svc) => {
+                    rec_system_services.push(svc);
                 }
                 _ => {}
             }
