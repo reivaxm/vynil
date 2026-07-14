@@ -5,6 +5,7 @@ pub const ALL_ITEMS: &[&str] = &[
     "clusterinfo",
     "vynilconfig",
     "packages",
+    "popularitycontest",
     "state",
     "children",
     "agentlog",
@@ -34,6 +35,7 @@ pub fn item_path(item: &str) -> &'static str {
         "clusterinfo" => "cluster/clusterinfo",
         "vynilconfig" => "config/vynilconfig",
         "packages" => "packages/packages",
+        "popularitycontest" => "cluster/popularitycontest",
         "state" => "instance/state",
         "children" => "instance/children",
         "agentlog" => "logs/agentlog",
@@ -94,6 +96,7 @@ mod tests {
         assert_eq!(item_path("clusterinfo"), "cluster/clusterinfo");
         assert_eq!(item_path("vynilconfig"), "config/vynilconfig");
         assert_eq!(item_path("packages"), "packages/packages");
+        assert_eq!(item_path("popularitycontest"), "cluster/popularitycontest");
         assert_eq!(item_path("state"), "instance/state");
         assert_eq!(item_path("children"), "instance/children");
         assert_eq!(item_path("agentlog"), "logs/agentlog");

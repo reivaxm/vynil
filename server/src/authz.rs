@@ -77,8 +77,8 @@ pub async fn check_item_access(
             return Err(DiagError::AuthorizationDenied);
         }
     }
-    // For packages item, check if it's enabled
-    else if item == "packages" && !packages_enabled {
+    // For packages/popularitycontest items, check if they are enabled
+    else if matches!(item, "packages" | "popularitycontest") && !packages_enabled {
         return Err(DiagError::PackagesDisabled);
     }
 
@@ -101,5 +101,6 @@ mod tests {
         assert!(!is_instance_scoped_item("clusterinfo"));
         assert!(!is_instance_scoped_item("vynilconfig"));
         assert!(!is_instance_scoped_item("packages"));
+        assert!(!is_instance_scoped_item("popularitycontest"));
     }
 }

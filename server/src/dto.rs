@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use common::Children;
 use serde::{Deserialize, Serialize};
 
@@ -67,4 +69,18 @@ pub struct ScrubStats {
 pub struct AnonymizedResponse<T> {
     pub data: T,
     pub scrub_stats: ScrubStats,
+}
+
+/// Popularity contest: aggregated package counts per jukebox -> category -> package
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PopularityContest {
+    /// JuKebox name -> category counts
+    pub jukeboxes: BTreeMap<String, JukeboxCategory>,
+}
+
+/// Category -> package counts for a given jukebox
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct JukeboxCategory {
+    /// Category name -> package counts
+    pub categories: BTreeMap<String, BTreeMap<String, u32>>,
 }

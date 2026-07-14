@@ -19,6 +19,7 @@ use crate::{
         clusterinfo::get_cluster_info,
         logs::{get_agent_log, get_child_logs, get_operator_log},
         packages::get_packages,
+        popularity_contest::get_popularity_contest,
         state::get_instance_state,
         vynilconfig::get_vynil_config,
     },
@@ -54,10 +55,11 @@ const INSTANCE_PATH: &str = "/apis/admin.vynil.solidite.fr/v1/namespaces/:ns/:ki
 const VALID_KINDS: [&str; 3] = ["tenantinstances", "serviceinstances", "systeminstances"];
 
 /// Valid items for the diagnostic API
-const VALID_ITEMS: [&str; 8] = [
+const VALID_ITEMS: [&str; 9] = [
     "clusterinfo",
     "vynilconfig",
     "packages",
+    "popularitycontest",
     "state",
     "children",
     "agentlog",
@@ -284,6 +286,11 @@ async fn instance_handler(
             // Generic tier - authorization already checked above
             let packages = get_packages(&state.client).await?;
             Ok((StatusCode::OK, Json(packages)).into_response())
+        }
+        "popularitycontest" => {
+            // Generic tier - authorization already checked above
+            let popularity = get_popularity_contest(&state.client).await?;
+            Ok((StatusCode::OK, Json(popularity)).into_response())
         }
         "state" => {
             let (yaml, stats) =
