@@ -142,7 +142,7 @@ pub use vynil_core::{
     Semver, chrono as chronohandler, glob as globhandler, hashes as hasheshandlers, http as httphandler,
     http_mock as httpmock, k8s as k8sgeneric, k8s as k8sraw, k8s as k8sworkload, key as ed25519handler,
     oci as ocihandler, password as passwordhandler, register_k8s_generic, register_k8s_object,
-    register_k8s_raw, s3 as s3handler, semver as semverhandler, shell as shellhandler,
+    register_k8s_raw, s3 as s3handler, semver as semverhandler, set_client_name, shell as shellhandler,
 };
 
 /// Children describe a k8s object

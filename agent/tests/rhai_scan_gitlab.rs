@@ -20,6 +20,7 @@ const REGISTRY: &str = "registry.gitlab.com";
 const PULL_SECRET: &str = "gitlab-registry-pull";
 
 fn make_gitlab_scan_script(k8s_mocks: Vec<Dynamic>) -> (Script, Arc<Mutex<Vec<Dynamic>>>) {
+    common::set_client_name(common::get_client_name);
     let base = env!("CARGO_MANIFEST_DIR");
     let created = Arc::new(Mutex::new(vec![]));
     let mut script = Script::new_core(vec![

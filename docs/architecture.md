@@ -22,8 +22,8 @@ vynil/
 ### vynil-core (library)
 
 The generic, vynil-agnostic toolbox, extracted from `common` so it can be reused outside vynil
-(kuberest, kydah). Developed in-tree (`core/`) as a path dependency of `common` (phase T0); to be
-published to crates.io later (phase T2). See `core/README.md`.
+(kuberest, kydah). Published as [`vynil-core`](https://crates.io/crates/vynil-core) on crates.io;
+`common` consumes it as a regular crates.io dependency. Source: https://github.com/sebt3/vynil-core.
 
 - **Rhai engine**: `Script` (`new_bare`) + generic helpers (datetime, hashes, password, ed25519,
   semver, glob, shell, serde-YAML, base64/json, file I/O)
@@ -258,7 +258,7 @@ Key trait methods:
 
 | Usage | Library | Key order | Lives in |
 |---|---|---|---|
-| All Rust code (serialization/deserialization) | `serde_yaml` | Alphabetical | `vynil-core` (`core/src/yaml.rs`) |
+| All Rust code (serialization/deserialization) | `serde_yaml` | Alphabetical | `vynil-core` (`src/yaml.rs`) |
 | `yaml_decode_ordered` / `yaml_encode_ordered` (Rhai) | `rust-yaml` | Preserved | `common` (`yamlhandler.rs`) |
 
 The serde-YAML helpers live in `vynil-core`; the order-preserving `YamlDoc` (rust-yaml) stays in

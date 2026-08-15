@@ -197,7 +197,7 @@ pub fn get_reporter() -> Reporter {
 /// that applies k8s objects, BEFORE the first reconcile.
 pub fn wire_core_k8s() {
     vynil_core::k8s::set_get_client(Box::new(get_client));
-    vynil_core::k8s::set_get_client_name(Box::new(get_client_name));
+    vynil_core::set_client_name(get_client_name);
     vynil_core::k8s::set_get_labels(Box::new(get_labels));
     vynil_core::k8s::set_get_owner(Box::new(get_owner));
     vynil_core::k8s::set_get_owner_ns(Box::new(get_owner_ns));
