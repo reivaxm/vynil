@@ -32,10 +32,9 @@ fn list_repository(spec, namespace) {
         throw `Unable to list repositories for project ${project} (id: ${project_id}) on ${url}: HTTP ${initial.code}`;
     }
 
-    // GitLab paginates via X-Total-Pages header
-    let total_pages = if "x-total-pages" in initial.headers.keys() {
-        parse_int(initial.headers["x-total-pages"])
-    } else { 1 };
+    // GitLab paginates via the X-Total-Pages header
+    let total_pages_header = headers_get(initial.headers, "x-total-pages");
+    let total_pages = if total_pages_header == () { 1 } else { parse_int(total_pages_header) };
 
     // The `location` field is the full OCI image reference (registry/path)
     let result = initial.json.map(|r| r.location);

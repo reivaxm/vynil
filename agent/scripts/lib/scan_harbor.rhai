@@ -18,8 +18,9 @@ fn list_repository(spec, namespace) {
     if initial.code != 200 {
         throw `Unable to list from ${registry}/${project}`;
     }
-    let max_size = parse_int(initial.headers["x-total-count"]);
-    let max_pages = to_int(ceiling(max_size/10.0))+1;
+    // Harbor paginates via the X-Total-Count header
+    let max_size = parse_int(headers_get(initial.headers, "x-total-count"));
+    let max_pages = to_int(ceiling(max_size / 10.0)) + 1;
     let result = initial.json.map(|p| `${registry}/${p.name}`);
     for i in 2..max_pages {
         let list = harbor.get(`api/v2.0/projects/${project}/repositories?page=${i}&page_size=10&sort=name`);

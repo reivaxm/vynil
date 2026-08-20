@@ -593,6 +593,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4693,13 +4699,13 @@ version = "0.7.9-alpha.1"
 
 [[package]]
 name = "vynil-core"
-version = "0.5.0"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c19072299ba8e8f6f3b6fd5a0703dd7f7f06df1224c7954e0217dbc57dda39"
+checksum = "893986979c169fc3e14c01829f8f1eb2d1e0033429c4854479f9354bc114f121"
 dependencies = [
  "actix-web",
  "argon2",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bcrypt",
  "chrono",
  "crc32fast",
